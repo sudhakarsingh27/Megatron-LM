@@ -2058,7 +2058,7 @@ class TestFusedMLAQUpProjIntegration:
         Utils.destroy_model_parallel()
 
     def test_fused_vs_unfused_q_forward(self):
-        """MXFP8 Q from the cuDNN fused kernel matches unfused MXFP8 GEMM + Triton-RoPE + quantize.
+        """The cuDNN BF16-FMA kernel exactly matches unfused GEMM + Triton-RoPE + quantize.
 
         Runs the same inputs through:
           Fused:   FusedMLAQUpProjRopeQuant (cuDNN MXFP8 GEMM+RoPE+quant in one kernel)
@@ -2069,6 +2069,10 @@ class TestFusedMLAQUpProjIntegration:
         Both the rowwise Q (used in QK^T) and columnwise Q (used in dK GEMM in the attention
         backward) are compared, since a bug in the columnwise output would silently degrade
         K-path gradients without any other test catching it.
+
+        NVTE_FUSED_Q_UPROJ_ROPE_BF16_FMA must be set before Python starts because cuDNN reads it
+        when the kernel module is imported. The test skips if that specialization is unavailable
+        and fails if it is installed but inactive; it never tests the legacy FP32 RoPE path.
         """
         import transformer_engine_torch as tex
         from transformer_engine.pytorch.attention import FusedMLAQUpProjRopeQuant
@@ -2076,12 +2080,32 @@ class TestFusedMLAQUpProjIntegration:
             mxfp8_quantize_only,
         )
         from transformer_engine.pytorch.cpp_extensions import general_gemm as _te_general_gemm
-        from transformer_engine.pytorch.tensor.mxfp8_tensor import MXFP8Quantizer, MXFP8Tensor
+        from transformer_engine.pytorch.tensor.mxfp8_tensor import MXFP8Quantizer
 
         if mla_module.FusedMLAQUpProjRopeQuant is None or not FusedMLAQUpProjRopeQuant.is_supported():
             pytest.skip("Fused MLA Q up-projection requires SM100+ and cuDNN frontend 1.27+")
         if mla_module.fused_apply_mla_rope_for_q is None:
             pytest.skip("fused_apply_mla_rope_for_q not available")
+
+        try:
+            from cudnn.gemm.cutedsl.dense.proj_rope_mxfp8 import api as fused_api
+            from cudnn.gemm.cutedsl.dense.proj_rope_mxfp8 import (
+                gemm_proj_rope_mxfp8_mxfp8in as fused_kernel,
+            )
+        except ImportError:
+            pytest.skip("Requires a cuDNN frontend containing the BF16-FMA kernel")
+        if not hasattr(fused_kernel, "ROPE_BF16_FMA"):
+            pytest.skip("Requires cuDNN frontend PR 723 or equivalent")
+        assert fused_kernel.ROPE_BF16_FMA, (
+            "The BF16-FMA kernel is installed but inactive; set "
+            "NVTE_FUSED_Q_UPROJ_ROPE_BF16_FMA=1 before Python starts"
+        )
+        assert (
+            FusedMLAQUpProjRopeQuant._kernel() is fused_api.gemm_proj_rope_mxfp8_wrapper_sm100
+        ), "TE is not dispatching to the expected cuDNN fused wrapper"
+        assert (
+            fused_api._mxfp8in_host is fused_kernel.gemm_proj_rope_mxfp8_host
+        ), "The cuDNN wrapper is not dispatching to the expected MXFP8 kernel"
 
         fused_apply_rope = mla_module.fused_apply_mla_rope_for_q
 
@@ -2093,8 +2117,6 @@ class TestFusedMLAQUpProjIntegration:
         Q_HEAD_DIM = QK_HEAD_DIM + QK_ROPE_DIM   # 192
         Q_LORA_RANK = 1536
         PROJ_DIM = NH * Q_HEAD_DIM               # 24576
-        BLOCK = 32
-        E8M0_BIAS = 127
         device = torch.device("cuda")
 
         torch.manual_seed(42)
@@ -2159,51 +2181,24 @@ class TestFusedMLAQUpProjIntegration:
         )
 
         # ── Compare ───────────────────────────────────────────────────────────────────
-        # Compare MXFP8 Q from both paths directly.  Each path applies E4M3 quantization
-        # (≤6.25% relative error) on top of a GEMM that may differ by ~2% between the
-        # cuDNN and cuBLAS accumulators, giving a worst-case combined rtol of ~0.14.
-        # Use the combined rtol=0.14 bound; exceeding it would indicate a systematic
-        # bias beyond normal FP8 quantization noise.
-        def _deq_row(t: MXFP8Tensor) -> torch.Tensor:
-            tokens = S * B
-            q_2d = MXFP8Tensor(
-                shape=(tokens, PROJ_DIM),
-                dtype=torch.bfloat16,
-                rowwise_data=t._rowwise_data.view(tokens, PROJ_DIM),
-                rowwise_scale_inv=t._rowwise_scale_inv.view(tokens, PROJ_DIM // BLOCK),
-                columnwise_data=None,
-                columnwise_scale_inv=None,
-                quantizer=t._quantizer,
-                requires_grad=False,
-                fp8_dtype=t._fp8_dtype,
-                with_gemm_swizzled_scales=False,
-            )
-            return q_2d.dequantize().to(torch.bfloat16).view(S, B, NH, Q_HEAD_DIM)
+        # The BF16-FMA specialization exists to reproduce Megatron's Triton RoPE arithmetic
+        # exactly. Compare the one-byte E4M3 payloads as raw bytes because TE may expose them
+        # as uint8 while cuDNN exposes float8_e4m3fn.
+        def _raw_bytes(tensor):
+            return tensor.contiguous().view(torch.uint8)
 
-        def _deq_col(t: MXFP8Tensor) -> torch.Tensor:
-            tokens = S * B
-            fp8_col = t._columnwise_data.view(tokens, NH, Q_HEAD_DIM)
-            scale_col = t._columnwise_scale_inv.view(tokens // BLOCK, NH, Q_HEAD_DIM)
-            inv = torch.pow(2.0, scale_col.to(torch.float32) - E8M0_BIAS).unsqueeze(1)
-            # TE's C++ quantizer stores _columnwise_data as uint8 (raw E4M3 bit patterns).
-            # The cuDNN kernel returns out_fp8_col as float8_e4m3fn.
-            # Either way, reinterpret the bits as float8_e4m3fn before converting to float32.
-            if fp8_col.dtype == torch.uint8:
-                fp8_col = fp8_col.view(torch.float8_e4m3fn)
-            return (
-                fp8_col.to(torch.float32)
-                .view(tokens // BLOCK, BLOCK, NH, Q_HEAD_DIM)
-                .mul_(inv)
-                .reshape(S, B, NH, Q_HEAD_DIM)
-                .to(torch.bfloat16)
-            )
-
-        torch.testing.assert_close(
-            _deq_row(query_fused), _deq_row(query_unfused), atol=1.0, rtol=0.14
-        )
-        torch.testing.assert_close(
-            _deq_col(query_fused), _deq_col(query_unfused), atol=1.0, rtol=0.14
-        )
+        assert torch.equal(
+            _raw_bytes(query_fused._rowwise_data), _raw_bytes(query_unfused._rowwise_data)
+        ), "rowwise FP8 payload differs"
+        assert torch.equal(
+            query_fused._rowwise_scale_inv, query_unfused._rowwise_scale_inv
+        ), "rowwise E8M0 scale differs"
+        assert torch.equal(
+            _raw_bytes(query_fused._columnwise_data), _raw_bytes(query_unfused._columnwise_data)
+        ), "columnwise FP8 payload differs"
+        assert torch.equal(
+            query_fused._columnwise_scale_inv, query_unfused._columnwise_scale_inv
+        ), "columnwise E8M0 scale differs"
 
     def test_end_to_end_backward_uses_te_autograd(self):
         with mock.patch.dict(
